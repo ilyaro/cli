@@ -17,6 +17,7 @@ type fakeOP struct {
 	item   *itemJSON
 	calls  [][]string
 	failOn string
+	title  string
 }
 
 type itemJSON struct {
@@ -44,6 +45,7 @@ func (f *fakeOP) Run(_ context.Context, stdin []byte, args ...string) ([]byte, [
 		return []byte(`{"account_uuid":"acct1"}`), nil, nil
 	case "item create", "item edit":
 		var doc struct {
+			Title  string  `json:"title"`
 			Fields []field `json:"fields"`
 		}
 		if err := json.Unmarshal(stdin, &doc); err != nil {
@@ -53,6 +55,9 @@ func (f *fakeOP) Run(_ context.Context, stdin []byte, args ...string) ([]byte, [
 			f.item = &itemJSON{ID: "item1", Vault: vault{ID: "vault1"}}
 		}
 		f.item.Fields = doc.Fields
+		if args[1] == "create" {
+			f.title = doc.Title
+		}
 	case "item delete":
 		f.item = nil
 		return nil, nil, nil
@@ -85,6 +90,7 @@ func TestOnePasswordLoginStoresOnlyInOnePassword(t *testing.T) {
 	require.Equal(t, "new-token", cred.Token)
 	require.Equal(t, gh.TokenSourceOnePassword, cred.Source)
 	require.True(t, authCfg.OnePasswordUser("github.com", "monalisa"))
+	require.Equal(t, "ghcli_monalisa_github.com", fake.title)
 
 	// The keychain entry is neither read as the credential nor modified.
 	old, err := keyring.Get(keyringServiceName("github.com"), "monalisa")

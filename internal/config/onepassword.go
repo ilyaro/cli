@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/onepassword"
@@ -195,10 +194,7 @@ func (c *AuthConfig) loginOnePassword(hostname, username string, credential gh.C
 		if err != nil {
 			return err
 		}
-		title := fmt.Sprintf("GitHub CLI: %s@%s", username, hostname)
-		if name, err := os.Hostname(); err == nil && name != "" {
-			title += " (" + name + ")"
-		}
+		title := fmt.Sprintf("ghcli_%s_%s", username, hostname)
 		if ref, err = client.Create(ctx, accountID, title, secret); err != nil {
 			return err
 		}
