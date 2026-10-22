@@ -124,7 +124,8 @@ func classify(opName string, err error, stderr string) error {
 	switch {
 	case errors.As(err, &execErr), errors.Is(err, exec.ErrNotFound):
 		return &Error{Kind: ErrUnavailable, Op: opName, Details: "op executable not found"}
-	case strings.Contains(lower, "isn't an item"), strings.Contains(lower, "not found"), strings.Contains(lower, "no item"):
+	case strings.Contains(lower, "isn't an item"), strings.Contains(lower, "not found"), strings.Contains(lower, "no item"),
+		strings.Contains(lower, "could not find item"):
 		return &Error{Kind: ErrNotFound, Op: opName}
 	case strings.Contains(lower, "not currently signed in"), strings.Contains(lower, "not signed in"), strings.Contains(lower, "no accounts configured"),
 		strings.Contains(lower, "authorization prompt"), strings.Contains(lower, "locked"), strings.Contains(lower, "sign in"):

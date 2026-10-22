@@ -55,6 +55,8 @@ func TestGet(t *testing.T) {
 	t.Run("classifies errors", func(t *testing.T) {
 		_, err := NewClientWithRunner(&fakeRunner{err: errors.New("exit 1"), stderr: `"item1" isn't an item`}).Get(context.Background(), ref)
 		require.ErrorIs(t, err, ErrNotFound)
+		err = NewClientWithRunner(&fakeRunner{err: errors.New("exit 1"), stderr: "[ERROR] 2026/10/22 20:51:29 unable to process line 1: could not find item to edit"}).Update(context.Background(), ref, Secret{AccessToken: "t"})
+		require.ErrorIs(t, err, ErrNotFound)
 		_, err = NewClientWithRunner(&fakeRunner{err: errors.New("exit 1"), stderr: "[ERROR] account is not currently signed in"}).Get(context.Background(), ref)
 		require.ErrorIs(t, err, ErrUnavailable)
 	})
