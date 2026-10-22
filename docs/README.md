@@ -20,6 +20,7 @@ not public issues or pull requests.
 | Work with API clients, host selection, and GHES capabilities | [API and hosts](api-and-hosts.md) |
 | Change API gateway routing | [`api_host`](api-host.md) and its [test harness](api-host-test-harness.md) |
 | Run or change live acceptance tests | [Acceptance README](../acceptance/README.md); running these requires explicitly authorized resources and credentials |
+| Use or maintain this fork's 1Password credential storage | [1Password storage](onepassword.md) |
 | Prepare a pull request | [PR template](../.github/PULL_REQUEST_TEMPLATE.md) |
 
 Acceptance tests create and modify real GitHub resources. They are not part of

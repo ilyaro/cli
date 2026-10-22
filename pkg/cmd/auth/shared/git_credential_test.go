@@ -363,3 +363,24 @@ func TestResultingHelperCategory_detectionErrorWithoutSetup(t *testing.T) {
 		t.Errorf("ResultingHelperCategory() = %q, want %q", got, "error")
 	}
 }
+
+func TestSetup_onePasswordNeverUpdatesExternalHelper(t *testing.T) {
+	// No git credential commands are registered: any approve/reject call would make the stub fail the test.
+	_, restoreRun := run.Stub()
+	defer restoreRun(t)
+
+	cfg := &stubHelperConfig{helper: gitcredentials.Helper{Cmd: "osxkeychain"}}
+	f := GitCredentialFlow{
+		OnePassword:  true,
+		helper:       gitcredentials.Helper{Cmd: "osxkeychain"},
+		HelperConfig: cfg,
+		Updater:      &gitcredentials.Updater{GitClient: &git.Client{GitPath: "some/path/git"}},
+	}
+
+	if _, err := f.Setup("example.com", "monalisa", "PASSWD", false); err != nil {
+		t.Fatalf("Setup() error = %v", err)
+	}
+	if !cfg.configuredOur {
+		t.Error("expected gh to be configured as the credential helper")
+	}
+}

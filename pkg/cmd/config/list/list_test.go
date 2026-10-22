@@ -101,6 +101,7 @@ func Test_listRun(t *testing.T) {
 				prompt=disabled
 				prefer_editor_prompt=enabled
 				expiring_credentials=disabled
+				onepassword=disabled
 				pager=less
 				http_unix_socket=
 				browser=brave

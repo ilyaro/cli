@@ -7,6 +7,7 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/onepassword"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
@@ -79,12 +80,20 @@ func tokenRun(opts *TokenOptions) error {
 	switch {
 	// No flags: return the active token, refreshing it when necessary, from wherever it is stored.
 	case !opts.SecureStorage && !opts.NoRefresh:
-		cred, refreshStatus = getTokenWithRefresh(authCfg, hostname, opts.Username)
+		var readErr error
+		cred, refreshStatus, readErr = getTokenWithRefresh(authCfg, hostname, opts.Username)
+		if readErr != nil {
+			return readErr
+		}
 		val = cred.Token
 
 	// --no-refresh: return the stored active token from wherever it is stored, without refreshing.
 	case !opts.SecureStorage && opts.NoRefresh:
-		cred = getTokenReadOnly(authCfg, hostname, opts.Username)
+		var readErr error
+		cred, readErr = getTokenReadOnly(authCfg, hostname, opts.Username)
+		if readErr != nil {
+			return readErr
+		}
 		val = cred.Token
 
 	// --secure-storage: compatibility mode for go-gh, which cannot read gh's storage directly. A refreshable token
@@ -99,7 +108,11 @@ func tokenRun(opts *TokenOptions) error {
 		user := resolveUsername(authCfg, hostname, opts.Username)
 		var c gh.Credential
 		if user != "" {
-			c, refreshStatus = getTokenWithRefresh(authCfg, hostname, user)
+			var readErr error
+			c, refreshStatus, readErr = getTokenWithRefresh(authCfg, hostname, user)
+			if readErr != nil {
+				return readErr
+			}
 		}
 		if c.IsRefreshable() {
 			cred = c
@@ -121,7 +134,7 @@ func tokenRun(opts *TokenOptions) error {
 		user := resolveUsername(authCfg, hostname, opts.Username)
 		var c gh.Credential
 		if user != "" {
-			c = getTokenReadOnly(authCfg, hostname, user)
+			c, _ = getTokenReadOnly(authCfg, hostname, user)
 		}
 		if c.Source == gh.TokenSourceKeyring {
 			cred = c
@@ -179,24 +192,38 @@ func resolveUsername(authCfg gh.AuthConfig, hostname, username string) string {
 // getTokenReadOnly resolves the stored active token for the hostname and optional username without contacting the
 // token endpoint. It still surfaces a refreshable credential's stored access token, so an expiring token is
 // returned, just not refreshed.
-func getTokenReadOnly(authCfg gh.AuthConfig, hostname, username string) gh.Credential {
+func getTokenReadOnly(authCfg gh.AuthConfig, hostname, username string) (gh.Credential, error) {
 	if username == "" {
-		return authCfg.ActiveToken(hostname)
+		cred := authCfg.ActiveToken(hostname)
+		if cred.Token != "" || cred.Source != gh.TokenSourceOnePassword {
+			return cred, nil
+		}
+		// ActiveToken hides read errors; a failed 1Password read is retried per user so its cause can be reported.
+		username, _ = authCfg.ActiveUser(hostname)
 	}
-	cred, _ := authCfg.TokenForUser(hostname, username)
-	return cred
+	cred, err := authCfg.TokenForUser(hostname, username)
+	return cred, onePasswordError(err)
 }
 
 // getTokenWithRefresh resolves the active token for the hostname and optional username and refreshes it when
 // necessary. Refresh is best effort: a failed refresh still yields the last stored token, and an empty result is
 // left for the caller to handle.
-func getTokenWithRefresh(authCfg gh.AuthConfig, hostname, username string) (gh.Credential, gh.RefreshStatus) {
+func getTokenWithRefresh(authCfg gh.AuthConfig, hostname, username string) (gh.Credential, gh.RefreshStatus, error) {
 	if username == "" {
-		cred, status, _ := authCfg.ActiveTokenWithRefresh(hostname)
-		return cred, status
+		cred, status, err := authCfg.ActiveTokenWithRefresh(hostname)
+		return cred, status, onePasswordError(err)
 	}
-	cred, status, _ := authCfg.TokenForUserWithRefresh(hostname, username)
-	return cred, status
+	cred, status, err := authCfg.TokenForUserWithRefresh(hostname, username)
+	return cred, status, onePasswordError(err)
+}
+
+// onePasswordError returns err only when it comes from the 1Password credential store. Other read and refresh errors
+// stay best effort, but a 1Password failure has no fallback and must be reported instead of a misleading "no token".
+func onePasswordError(err error) error {
+	if opErr := (*onepassword.Error)(nil); errors.As(err, &opErr) {
+		return err
+	}
+	return nil
 }
 
 // getNonRefreshableTokenFromKeyring reads the token straight from secure storage for the hostname and optional

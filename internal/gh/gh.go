@@ -194,6 +194,8 @@ const (
 	// TokenSourceRefreshableOAuthToken indicates the token was read from the refreshable_oauth_token entry in the
 	// config file, which holds a refreshable credential and is kept distinct from the non-expiring oauth_token entry.
 	TokenSourceRefreshableOAuthToken = "refreshable_oauth_token"
+	// TokenSourceOnePassword indicates the token was read from a 1Password item through the op CLI.
+	TokenSourceOnePassword = "1password"
 	// TokenSourceDefault is the placeholder source reported when no token was found.
 	TokenSourceDefault = "default"
 )
