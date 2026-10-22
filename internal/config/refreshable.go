@@ -143,6 +143,11 @@ func (c *AuthConfig) loginRefreshable(hostname, username string, credential gh.C
 	if err := validateRefreshableCredential(credential); err != nil {
 		return false, err
 	}
+	if c.op.login {
+		return false, c.loginOnePassword(hostname, username, credential, gitProtocol)
+	}
+	// A user who moves to another store must not keep a 1Password reference that would shadow the new credential.
+	c.forgetOnePassword(hostname, username)
 
 	insecureStorageUsed := false
 	var setErr error
@@ -215,6 +220,15 @@ func (c *AuthConfig) purgeNonExpiringForRefreshableLogin(hostname, username stri
 // storage. It prefers the secure keyring and falls back to the insecure configuration record, returning
 // errRefreshableNotFound when neither exists.
 func (c *AuthConfig) refreshableForUser(hostname, username string) (gh.Credential, bool, error) {
+	// A 1Password user is read straight from its item; there is no keyring or config fallback.
+	if ref, ok := c.opRef(hostname, username); ok {
+		credential, err := c.readOP(hostname, username, ref)
+		if err == nil {
+			err = validateRefreshableCredential(credential)
+		}
+		return credential, true, err
+	}
+
 	// Consult the secure keyring first, matching TokenForUser. The two storage forms are mutually exclusive, so this
 	// never changes which credential is returned in practice, but keeping the precedence identical avoids confusing
 	// bugs if a misconfiguration ever left records in both places. Preferring the keyring also means the refresh
@@ -412,6 +426,12 @@ func (c *AuthConfig) refreshCredentialForUser(hostname, username string, credent
 		if err != nil {
 			return err
 		}
+		// Rotating a 1Password credential without the cross-process lock could spend the single-use refresh token
+		// twice and lose the new pair, so fail before the exchange instead of proceeding best effort.
+		if _, isOP := c.opRef(hostname, username); isOP && !lockHeld {
+			result = current
+			return errors.New("could not acquire the refresh lock needed to refresh the 1Password credential")
+		}
 		if !accessTokenNeedsRefresh(current, timeNow()) {
 			result = current
 			status = gh.RefreshStatusUnnecessary
@@ -494,6 +514,11 @@ func (c *AuthConfig) refreshCredentialForUser(hostname, username string, credent
 // called under the refresh lock). Each delete is best effort so a missing record or unavailable keyring does not stop
 // the others.
 func (c *AuthConfig) removeCredentialForUser(hostname, username string) error {
+	// A 1Password credential that can no longer be refreshed is deleted from 1Password. The hosts.yml reference stays,
+	// so later lookups report that the item is gone and ask for a new login rather than silently using another store.
+	if isOP, err := c.deleteOnePasswordItem(hostname, username); isOP {
+		return err
+	}
 	_ = keyring.Delete(refreshableServiceName(hostname), username)
 	_ = keyring.Delete(keyringServiceName(hostname), username)
 	_ = c.cfg.Remove(refreshablePath(hostname, username))
@@ -505,6 +530,10 @@ func (c *AuthConfig) removeCredentialForUser(hostname, username string) error {
 // Refreshable credentials are resolved per-user via the active user key, so there is no host-level active copy to keep
 // in sync.
 func (c *AuthConfig) persistRefreshedCredential(hostname, username string, credential gh.Credential, secure bool) error {
+	// A rotated 1Password credential goes back into the same item; hosts.yml holds no secret, so nothing is written.
+	if ref, ok := c.opRef(hostname, username); ok {
+		return c.writeOP(ref, credential)
+	}
 	if secure {
 		if err := c.setRefreshableInKeyring(hostname, username, credential); err != nil {
 			return err

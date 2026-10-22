@@ -1,18 +1,23 @@
 package login
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/git"
 	"github.com/cli/cli/v2/internal/authflow"
 	"github.com/cli/cli/v2/internal/browser"
+	"github.com/cli/cli/v2/internal/config"
 	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/onepassword"
 	"github.com/cli/cli/v2/pkg/cmd/auth/shared"
 	"github.com/cli/cli/v2/pkg/cmd/auth/shared/gitcredentials"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -44,6 +49,14 @@ type LoginOptions struct {
 	SkipSSHKeyPrompt bool
 	Expiring         *bool
 	Clipboard        *bool
+	// OnePassword stores the credential in 1Password through the op CLI instead of the system keyring. On success it
+	// also makes 1Password the default store for future logins.
+	OnePassword bool
+
+	// onePasswordPreflight verifies that op is installed and signed in. It is nil in production; tests replace it.
+	onePasswordPreflight func() error
+	// goos is the operating system name. It is empty in production, where runtime.GOOS is used.
+	goos string
 
 	// AuthFlow is indirected so tests can stub the interactive authorization. When nil, the shared login flow uses
 	// the real authflow.AuthFlow.
@@ -115,6 +128,13 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 			gh can mark the token as non-cacheable; with older git a credential caching helper may store
 			and reuse an expired token.
 
+			Use %[1]s--op%[1]s to keep the token (and refresh token) only in 1Password through the %[1]sop%[1]s CLI
+			instead of the system keyring (macOS only). The credential is saved in your default 1Password vault, gh
+			reads it from 1Password whenever it needs it, and gh remains the Git credential helper. A successful login
+			with %[1]s--op%[1]s makes 1Password the default store for later logins (see the %[1]sonepassword%[1]s
+			configuration); run %[1]sgh config set onepassword disabled%[1]s to stop that. Existing keyring
+			credentials are left untouched. Combine with %[1]s--expiring%[1]s for refreshable credentials.
+
 			For more information on OAuth scopes, see
 			<https://docs.github.com/en/developers/apps/building-oauth-apps/scopes-for-oauth-apps/>.
 		`, "`"),
@@ -144,6 +164,10 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 			}
 			if tokenStdin && opts.Expiring != nil && *opts.Expiring {
 				return cmdutil.FlagErrorf("specify only one of `--expiring` or `--with-token`")
+			}
+
+			if opts.OnePassword && opts.InsecureStorage {
+				return cmdutil.FlagErrorf("specify only one of `--op` or `--insecure-storage`")
 			}
 
 			if tokenStdin {
@@ -193,6 +217,7 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 	cmd.Flags().BoolVar(&opts.InsecureStorage, "insecure-storage", false, "Save authentication credentials in plain text instead of credential store")
 	cmd.Flags().BoolVar(&opts.SkipSSHKeyPrompt, "skip-ssh-key", false, "Skip generate/upload SSH key prompt")
 	cmdutil.NilBoolFlag(cmd, &opts.Expiring, "expiring", "", "Prefer expiring credentials that gh refreshes automatically, if the host supports them")
+	cmd.Flags().BoolVar(&opts.OnePassword, "op", false, "Save authentication credentials in 1Password (macOS) and use it by default for future logins")
 
 	return cmd
 }
@@ -203,6 +228,19 @@ func loginRun(opts *LoginOptions) error {
 		return err
 	}
 	authCfg := cfg.Authentication()
+	// Decide the credential store before any prompt or OAuth step, so a missing op fails early and never falls back.
+	useOP, err := resolveOnePassword(opts, cfg)
+	if err != nil {
+		return err
+	}
+	if useOP {
+		enabler, ok := authCfg.(interface{ UseOnePassword() })
+		if !ok {
+			return errors.New("1Password storage is not supported by this configuration")
+		}
+		enabler.UseOnePassword()
+	}
+
 	copyToClipboard := shared.ShouldCopyToClipboard(cfg, opts.Clipboard)
 
 	hostname := opts.Hostname
@@ -246,7 +284,10 @@ func loginRun(opts *LoginOptions) error {
 
 		// Adding a user key ensures that a nonempty host section gets written to the config file.
 		_, loginErr := authCfg.Login(hostname, username, opts.Token, opts.GitProtocol, !opts.InsecureStorage)
-		return loginErr
+		if loginErr != nil {
+			return loginErr
+		}
+		return enableOnePasswordDefault(opts, cfg)
 	}
 
 	helperConfig := opts.helperConfig
@@ -257,7 +298,7 @@ func loginRun(opts *LoginOptions) error {
 		}
 	}
 
-	return shared.Login(&shared.LoginOptions{
+	err = shared.Login(&shared.LoginOptions{
 		IO:              opts.IO,
 		Config:          authCfg,
 		HTTPClient:      httpClient,
@@ -273,6 +314,7 @@ func loginRun(opts *LoginOptions) error {
 			Prompter:     opts.Prompter,
 			IO:           opts.IO,
 			HelperConfig: helperConfig,
+			OnePassword:  useOP,
 			Updater: &gitcredentials.Updater{
 				GitClient: opts.GitClient,
 			},
@@ -285,6 +327,49 @@ func loginRun(opts *LoginOptions) error {
 		Telemetry:                   opts.Telemetry,
 		AuthFlow:                    opts.AuthFlow,
 	})
+	if err != nil {
+		return err
+	}
+	return enableOnePasswordDefault(opts, cfg)
+}
+
+// resolveOnePassword decides whether this login stores its credential in 1Password: explicitly through --op, or
+// because the global onepassword option is enabled and the user did not ask for plain text storage. It fails before
+// any login step when 1Password cannot be used, because there is deliberately no fallback to the keyring.
+func resolveOnePassword(opts *LoginOptions, cfg gh.Config) (bool, error) {
+	if !opts.OnePassword && (opts.InsecureStorage || !config.OnePasswordEnabled(cfg)) {
+		return false, nil
+	}
+	goos := opts.goos
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	if goos != "darwin" {
+		return false, errors.New("1Password storage is only supported on macOS")
+	}
+	preflight := opts.onePasswordPreflight
+	if preflight == nil {
+		preflight = func() error {
+			_, err := onepassword.NewClient().Preflight(context.Background())
+			return err
+		}
+	}
+	if err := preflight(); err != nil {
+		return false, fmt.Errorf("cannot use 1Password: %w; sign in with the op CLI and try again", err)
+	}
+	return true, nil
+}
+
+// enableOnePasswordDefault makes 1Password the default store for future logins after a successful explicit --op login.
+// The credential is already saved, so a failure here is reported as a partial success.
+func enableOnePasswordDefault(opts *LoginOptions, cfg gh.Config) error {
+	if !opts.OnePassword || config.OnePasswordEnabled(cfg) {
+		return nil
+	}
+	if err := config.EnableOnePasswordByDefault(cfg); err != nil {
+		return fmt.Errorf("logged in with 1Password, but could not make it the default: %w; run 'gh config set onepassword enabled'", err)
+	}
+	return nil
 }
 
 func promptForHostname(opts *LoginOptions) (string, error) {

@@ -3,11 +3,13 @@ package login
 import (
 	"bufio"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/onepassword"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
@@ -120,10 +122,17 @@ func helperRun(opts *CredentialOptions) error {
 	var gotUser string
 	// ActiveTokenWithRefresh refreshes an expired or near-expiry token before
 	// handing it to git; for non-refreshable tokens it is a no-op that just returns them.
-	cred, refreshStatus, _ := cfg.ActiveTokenWithRefresh(lookupHost)
+	cred, refreshStatus, refreshErr := cfg.ActiveTokenWithRefresh(lookupHost)
 	if cred.Token == "" && strings.HasPrefix(lookupHost, "gist.") {
 		lookupHost = strings.TrimPrefix(lookupHost, "gist.")
-		cred, refreshStatus, _ = cfg.ActiveTokenWithRefresh(lookupHost)
+		cred, refreshStatus, refreshErr = cfg.ActiveTokenWithRefresh(lookupHost)
+	}
+
+	// A credential stored in 1Password has no other store to fall back to. Tell the user why git gets nothing, on
+	// stderr which git surfaces, instead of failing silently.
+	if opErr := (*onepassword.Error)(nil); errors.As(refreshErr, &opErr) {
+		fmt.Fprintf(opts.IO.ErrOut, "%s\n", refreshErr)
+		return cmdutil.SilentError
 	}
 
 	// A rejected refresh token can only be recovered by re-authenticating. Notify the user on

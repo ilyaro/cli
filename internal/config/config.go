@@ -267,6 +267,8 @@ type AuthConfig struct {
 	// gh processes but not against goroutines sharing this single AuthConfig instance, so this mutex provides the
 	// in-process half of the mutual exclusion that keeps a rotating refresh token from being spent twice.
 	refreshMu sync.Mutex
+	// op holds the 1Password state; see onepassword.go.
+	op opState
 }
 
 // SetTokenRefresher supplies the refresher used to renew tokens. Because Authentication returns a single shared
@@ -292,14 +294,28 @@ func (c *AuthConfig) ActiveTokenType(hostname string) gh.TokenType {
 // a refreshable credential, and never contacts the token endpoint to refresh it. Callers that need a token valid for
 // API calls should use ActiveTokenWithRefresh.
 func (c *AuthConfig) ActiveToken(hostname string) gh.Credential {
+	credential, _ := c.activeToken(hostname)
+	return credential
+}
+
+// activeToken implements ActiveToken. The error is only ever set when the active account is stored in 1Password and
+// the credential could not be read; the credential is then empty and no other store is consulted, so a stale token
+// can never stand in for the 1Password one.
+func (c *AuthConfig) activeToken(hostname string) (gh.Credential, error) {
 	if c.tokenOverride != nil {
 		token, source := c.tokenOverride(hostname)
-		return gh.Credential{Source: source, Token: token}
+		return gh.Credential{Source: source, Token: token}, nil
 	}
 
 	token, source := ghauth.TokenFromEnvOrConfig(hostname)
 	if token != "" {
-		return gh.Credential{Source: source, Token: token}
+		return gh.Credential{Source: source, Token: token}, nil
+	}
+
+	if user, err := c.ActiveUser(hostname); err == nil {
+		if ref, ok := c.opRef(hostname, user); ok {
+			return c.readOP(hostname, user, ref)
+		}
 	}
 
 	// Intentional behavior change from older gh: the active-user lookup goes through TokenForUser, which also consults
@@ -312,24 +328,27 @@ func (c *AuthConfig) ActiveToken(hostname string) gh.Credential {
 	// TestActiveTokenPrefersPerUserConfigTokenOverUnkeyedKeyring.
 	if user, err := c.ActiveUser(hostname); err == nil {
 		if credential, err := c.TokenForUser(hostname, user); err == nil {
-			return credential
+			return credential, nil
 		}
 	}
 
 	// We should generally be able to find a token for the active user, but in some cases such as if the keyring was
 	// set up in a very old version of the CLI, it may only have an unkeyed token, so fall back to it.
 	if token, err := c.TokenFromKeyring(hostname); err == nil {
-		return gh.Credential{Source: gh.TokenSourceKeyring, Token: token}
+		return gh.Credential{Source: gh.TokenSourceKeyring, Token: token}, nil
 	}
 
-	return gh.Credential{Source: source, Token: token}
+	return gh.Credential{Source: source, Token: token}, nil
 }
 
 // ActiveTokenWithRefresh retrieves the active credential for the given hostname and, when it is refreshable and its
 // access token is expiring, renews and persists it, returning the credential to use and the refresh outcome.
 // Non-refreshable credentials are returned unchanged with RefreshStatusInapplicable.
 func (c *AuthConfig) ActiveTokenWithRefresh(hostname string) (gh.Credential, gh.RefreshStatus, error) {
-	credential := c.ActiveToken(hostname)
+	credential, err := c.activeToken(hostname)
+	if err != nil {
+		return credential, gh.RefreshStatusInapplicable, err
+	}
 	if !credential.IsRefreshable() {
 		return credential, gh.RefreshStatusInapplicable, nil
 	}
@@ -493,6 +512,12 @@ func (c *AuthConfig) Login(hostname, username, token, gitProtocol string, secure
 }
 
 func (c *AuthConfig) login(hostname, username, token, gitProtocol string, secureStorage bool) (bool, error) {
+	if c.op.login {
+		return false, c.loginOnePassword(hostname, username, gh.Credential{Token: token}, gitProtocol)
+	}
+	// A user who moves to another store must not keep a 1Password reference that would shadow the new credential.
+	c.forgetOnePassword(hostname, username)
+
 	// In this section we set up the users config
 	var setErr error
 	if secureStorage {
@@ -551,7 +576,8 @@ func (c *AuthConfig) SwitchUser(hostname, user string) error {
 	previousSource := c.ActiveToken(hostname).Source
 	if previousSource != gh.TokenSourceKeyring &&
 		previousSource != gh.TokenSourceOAuthToken &&
-		previousSource != gh.TokenSourceRefreshableOAuthToken {
+		previousSource != gh.TokenSourceRefreshableOAuthToken &&
+		previousSource != gh.TokenSourceOnePassword {
 		return fmt.Errorf("currently active token for %s is from %s", hostname, previousSource)
 	}
 
@@ -584,9 +610,16 @@ func (c *AuthConfig) Logout(hostname, username string) error {
 
 		// The user's per-user keyring records are not covered by removing config keys, so delete them explicitly.
 		// Historically the per-user token was only removed in the single-user branch, leaking it when logging out of a
-		// multi-user host.
-		_ = keyring.Delete(refreshableServiceName(hostname), username)
-		_ = keyring.Delete(keyringServiceName(hostname), username)
+		// multi-user host. A 1Password user has no per-user keyring records, and any older keyring credential for the
+		// same name is deliberately left untouched; only the 1Password item is removed.
+		isOP, err := c.deleteOnePasswordItem(hostname, username)
+		if err != nil {
+			return err
+		}
+		if !isOP {
+			_ = keyring.Delete(refreshableServiceName(hostname), username)
+			_ = keyring.Delete(keyringServiceName(hostname), username)
+		}
 
 		// If there is only one (or zero) users, then we remove the host
 		// and unset the keyring tokens.
@@ -637,6 +670,13 @@ func (c *AuthConfig) activateUser(hostname, user string) error {
 // config, so it can also be used to restore state after a failed switch. It reports whether a credential was found
 // for the user.
 func (c *AuthConfig) setActiveCredential(hostname, user string) (bool, error) {
+	// A 1Password user is resolved through its hosts.yml reference, so activation only has to drop any host level
+	// plain text token that could outrank it. The keyring is not touched.
+	if _, ok := c.opRef(hostname, user); ok {
+		_ = c.cfg.Remove([]string{hostsKey, hostname, oauthTokenKey})
+		return true, nil
+	}
+
 	// Idempotently clear the non-expiring active representations so that no stale token can outrank the credential we
 	// are about to activate. Refreshable credentials have no host-level active copy, so there is nothing to clear for
 	// them; they are resolved per-user through the active user key.
@@ -690,6 +730,10 @@ func (c *AuthConfig) UsersForHost(hostname string) []string {
 // setActiveCredential so activation and resolution always agree on which credential is current, even in the mixed
 // state that should never occur because logging in with one kind removes the other.
 func (c *AuthConfig) TokenForUser(hostname, user string) (gh.Credential, error) {
+	if ref, ok := c.opRef(hostname, user); ok {
+		return c.readOP(hostname, user, ref)
+	}
+
 	if token, err := keyring.Get(keyringServiceName(hostname), user); err == nil {
 		return gh.Credential{Source: gh.TokenSourceKeyring, Token: token}, nil
 	}
@@ -873,6 +917,16 @@ var Options = []ConfigOption{
 		AllowedValues: []string{"enabled", "disabled"},
 		CurrentValue: func(c gh.Config, hostname string) string {
 			return c.ExpiringCredentials(hostname).Value
+		},
+	},
+	{
+		Key:           onepasswordKey,
+		Description:   "toggle storing new logins in 1Password through the op CLI instead of the system keyring",
+		DefaultValue:  "disabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		Scope:         ConfigScopeGlobalOnly,
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.GetOrDefault("", onepasswordKey).Unwrap().Value
 		},
 	},
 	{
