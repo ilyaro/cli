@@ -26,6 +26,10 @@ type GitCredentialFlow struct {
 	HelperConfig HelperConfig
 	Updater      *gitcredentials.Updater
 
+	// OnePassword marks a login whose credential is stored in 1Password. No external credential helper may receive such
+	// a credential, so Setup always makes gh the helper, which reads the token from 1Password on demand.
+	OnePassword bool
+
 	shouldSetup     bool
 	expiring        bool
 	helper          gitcredentials.Helper
@@ -194,6 +198,11 @@ func (flow *GitCredentialFlow) ShouldSetup() bool {
 // during the auth flow, so the --expiring preference alone cannot determine it beforehand. Setup is only reached
 // when the user already opted into git setup during the interactive prompt, so prompting again here is safe.
 func (flow *GitCredentialFlow) Setup(hostname, username, authToken string, refreshable bool) (string, error) {
+	if flow.OnePassword {
+		flow.configuredOurs = true
+		return "", flow.HelperConfig.ConfigureOurs(hostname)
+	}
+
 	// If there is no credential helper configured then we will set ourselves up as
 	// the credential helper for this host.
 	if !flow.helper.IsConfigured() {

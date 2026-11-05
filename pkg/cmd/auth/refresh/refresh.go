@@ -280,6 +280,13 @@ func refreshRun(opts *RefreshOptions) error {
 	if activeUser != "" && activeUser != result.Username {
 		return fmt.Errorf("error refreshing credentials for %s, received credentials for %s, did you use the correct account in the browser?", activeUser, result.Username)
 	}
+	// An account stored in 1Password stays there, so the renewed credential replaces the existing 1Password item.
+	if opCfg, ok := authCfg.(interface {
+		OnePasswordUser(hostname, username string) bool
+		UseOnePassword()
+	}); ok && opCfg.OnePasswordUser(hostname, result.Username) {
+		opCfg.UseOnePassword()
+	}
 	if result.Refreshable != nil {
 		if insecureStorageUsed, err := authCfg.LoginRefreshable(hostname, result.Username, *result.Refreshable, "", !opts.InsecureStorage); err != nil {
 			return err

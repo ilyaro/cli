@@ -11,6 +11,7 @@ import (
 	"github.com/cli/cli/v2/internal/gh"
 	ghmock "github.com/cli/cli/v2/internal/gh/mock"
 	"github.com/cli/cli/v2/internal/keyring"
+	"github.com/cli/cli/v2/internal/onepassword"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
@@ -778,6 +779,52 @@ func TestTokenRunRefresh(t *testing.T) {
 					require.Equal(t, "github.com", calls[0].Hostname)
 				}
 			}
+		})
+	}
+}
+
+// opFailingAuthConfig simulates a 1Password-backed account whose credential cannot be read.
+type opFailingAuthConfig struct {
+	gh.AuthConfig
+	err error
+}
+
+func (a opFailingAuthConfig) DefaultHost() (string, string) { return "github.com", "default" }
+func (a opFailingAuthConfig) ActiveUser(string) (string, error) {
+	return "test-user", nil
+}
+func (a opFailingAuthConfig) ActiveToken(string) gh.Credential {
+	return gh.Credential{Source: gh.TokenSourceOnePassword}
+}
+func (a opFailingAuthConfig) TokenForUser(string, string) (gh.Credential, error) {
+	return gh.Credential{Source: gh.TokenSourceOnePassword}, a.err
+}
+func (a opFailingAuthConfig) TokenForUserWithRefresh(string, string) (gh.Credential, gh.RefreshStatus, error) {
+	return gh.Credential{Source: gh.TokenSourceOnePassword}, gh.RefreshStatusFailed, a.err
+}
+
+func TestTokenRunOnePasswordError(t *testing.T) {
+	opErr := &onepassword.Error{Kind: onepassword.ErrUnavailable, Op: "read"}
+
+	for name, opts := range map[string]TokenOptions{
+		"secure-storage":               {SecureStorage: true},
+		"secure-storage and norefresh": {SecureStorage: true, NoRefresh: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ios, _, stdout, _ := iostreams.Test()
+			opts.IO = ios
+			opts.Username = "test-user"
+			opts.Config = func() (gh.Config, error) {
+				return &ghmock.ConfigMock{
+					AuthenticationFunc: func() gh.AuthConfig {
+						return opFailingAuthConfig{err: opErr}
+					},
+				}, nil
+			}
+
+			err := tokenRun(&opts)
+			require.ErrorIs(t, err, onepassword.ErrUnavailable)
+			require.Empty(t, stdout.String())
 		})
 	}
 }
